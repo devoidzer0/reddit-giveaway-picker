@@ -1,0 +1,10 @@
+<?php
+/**
+ * Reddit Giveaway Picker configuration
+ * Keep this file private.
+ */
+return [
+    'reddit_client_id' => 'PASTE_CLIENT_ID_HERE',
+    'reddit_client_secret' => 'PASTE_CLIENT_SECRET_HERE',
+    'user_agent' => 'web:reddit-giveaway-picker:2.0 (by /u/YourRedditUsername)',
+];

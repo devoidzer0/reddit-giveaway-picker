@@ -1,0 +1,7 @@
+# Local secrets
+config.php
+
+# macOS / editor noise
+.DS_Store
+.vscode/
+.idea/

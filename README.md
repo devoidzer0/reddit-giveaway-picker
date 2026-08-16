@@ -4,6 +4,28 @@ This version uses Reddit OAuth/Data API access only to retrieve the giveaway thr
 
 It does **not** make per-user profile lookups for account age or comment karma. Eligibility is assumed to have already been enforced by the subreddit/moderation system before the drawing.
 
+## Why this tool exists
+
+Traditional Reddit raffle tools are designed primarily to select random commenters as winners. That works well when a giveaway has a single prize or when all prizes are interchangeable, but it does not address the allocation problem created by a giveaway containing many different games.
+
+This application is designed for a single Reddit giveaway post containing multiple Steam games. Entrants can submit a ranked list of the games they would like to receive.
+
+For example, an entrant might comment:
+
+```text
+1. Game A
+2. Game C
+3. Game F
+```
+
+The application reads the giveaway's top-level comments and matches each entrant's ranked choices against the giveaway's master game list. The operator reviews the parsed choices before any drawing occurs.
+
+The application then generates one random ordering of the entrants. Starting with the first randomly ordered entrant, each person receives their highest-ranked game that is still available. Once a game has been awarded, it is removed from the available pool. If all of an entrant's requested games have already been awarded, that entrant is skipped and the application continues through the same random ordering.
+
+This allows a multi-game giveaway to be conducted in one Reddit post while preserving both random winner selection and entrants' ranked game preferences.
+
+Reddit API access is used only to retrieve the giveaway post and its public top-level comments. All preference parsing, operator review, randomization, and prize allocation occur within the application.
+
 ## Ranked giveaway allocation
 
 Entrants may list multiple games in order of preference.

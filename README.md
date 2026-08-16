@@ -1,4 +1,6 @@
-# Reddit Giveaway Picker — Ranked Random Order (API)
+# Reddit Ranked Game Giveaway Picker
+
+A non-commercial PHP utility for multi-game Reddit giveaways that parses entrants' ranked game preferences, randomizes entrants once, and assigns each winner their highest-ranked game that is still available.
 
 This version uses Reddit OAuth/Data API access only to retrieve the giveaway thread and its visible top-level comments.
 

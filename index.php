@@ -1,26 +1,19 @@
 <?php
 declare(strict_types=1);
-
 session_start();
 
 $configFile = __DIR__ . '/config.php';
 if (!file_exists($configFile)) {
     http_response_code(500);
-    echo '<h1>Setup required</h1><p>Copy <code>config.php.example</code> to <code>config.php</code> and add your Reddit API credentials.</p>';
+    echo '<h1>Setup required</h1><p>Copy <code>config.php.example</code> to <code>config.php</code> and add Reddit API credentials.</p>';
     exit;
 }
 $config = require $configFile;
 
-const APP_NAME = 'Reddit Giveaway Picker';
-const MIN_ACCOUNT_AGE_DAYS = 10;
-const MIN_COMMENT_KARMA = 150;
+const APP_NAME = 'Reddit Giveaway Picker — Ranked Random Order';
 
 function h(string $s): string {
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-}
-
-function normalizeSpace(string $s): string {
-    return trim((string)preg_replace('/\s+/u', ' ', $s));
 }
 
 function redditRequest(string $url, array $headers = []): array {
@@ -174,6 +167,15 @@ function fetchThread(array $config, string $token, string $postPath): array {
     ];
 }
 
+
+
+
+
+
+function normalizeSpace(string $s): string {
+    return trim((string)preg_replace('/\s+/u', ' ', $s));
+}
+
 function parseGames(string $text): array {
     $games = [];
     foreach (preg_split('/\R/u', $text) ?: [] as $line) {
@@ -185,8 +187,7 @@ function parseGames(string $text): array {
 
 function simplify(string $s): string {
     $s = mb_strtolower($s, 'UTF-8');
-    $s = preg_replace('/[^\p{L}\p{N}]+/u', '', $s) ?? '';
-    return $s;
+    return preg_replace('/[^\p{L}\p{N}]+/u', '', $s) ?? '';
 }
 
 function tokens(string $s): array {
@@ -195,220 +196,347 @@ function tokens(string $s): array {
     return array_values(array_filter(preg_split('/\s+/u', trim($s)) ?: []));
 }
 
-function levenshteinUtf8(string $a, string $b): int {
-    // Game titles are overwhelmingly ASCII/Latin. Transliterate when intl is available.
-    if (function_exists('transliterator_transliterate')) {
-        $a = transliterator_transliterate('Any-Latin; Latin-ASCII', $a) ?: $a;
-        $b = transliterator_transliterate('Any-Latin; Latin-ASCII', $b) ?: $b;
-    }
-    return levenshtein($a, $b);
-}
-
 function titleSimilarity(string $candidate, string $game): float {
     $a = simplify($candidate);
     $b = simplify($game);
     if ($a === '' || $b === '') return 0.0;
     if ($a === $b) return 1.0;
-    $maxLen = max(strlen($a), strlen($b));
-    if ($maxLen === 0) return 1.0;
-    return max(0.0, 1.0 - (levenshteinUtf8($a, $b) / $maxLen));
+    $max = max(strlen($a), strlen($b));
+    return $max ? max(0.0, 1.0 - (levenshtein($a, $b) / $max)) : 1.0;
 }
 
-function bestGameMatch(string $body, array $games): array {
-    $bodyLower = mb_strtolower($body, 'UTF-8');
-    $exact = [];
+function fragmentLikelyGame(string $fragment, array $games): bool {
+    $fragment = stripPreferenceNoise(trim($fragment));
+    if ($fragment === '' || mb_strlen($fragment, 'UTF-8') < 2) return false;
+
     foreach ($games as $game) {
-        if (mb_stripos($body, $game, 0, 'UTF-8') !== false) $exact[] = $game;
+        $score = titleSimilarity($fragment, $game);
+        $score = max($score, acronymMatchScore($fragment, $game));
+        $fs = simplify($fragment);
+        $gs = simplify($game);
+        if ($fs !== '' && strlen($fs) >= 3 && (str_contains($gs, $fs) || str_contains($fs, $gs))) {
+            $score = max($score, 0.76);
+        }
+        if ($score >= 0.48) return true;
     }
-    if (count($exact) === 1) return ['status'=>'confident','game'=>$exact[0],'score'=>1.0,'reason'=>'exact title'];
-    if (count($exact) > 1) return ['status'=>'uncertain','game'=>null,'score'=>1.0,'reason'=>'mentions multiple game titles','candidates'=>$exact];
+    return false;
+}
 
-    // Generate short word windows from the comment and compare them to each game.
-    $bodyTokens = tokens($body);
-    $scores = [];
-    foreach ($games as $game) {
-        $gt = tokens($game);
-        $n = count($gt);
-        $best = 0.0;
+function preferenceSegments(string $body, array $games = []): array {
+    $body = str_replace(["\r\n", "\r"], "\n", $body);
+    $body = html_entity_decode($body, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $body = str_replace(["•", "·", "▪", "◦", "‣", "–", "—", "−"], ["\n", "\n", "\n", "\n", "\n", " - ", " - ", " - "], $body);
 
-        // Whole-comment containment after punctuation/spacing removal handles "Cyber Punk 2077".
-        $simpleBody = simplify($body);
-        $simpleGame = simplify($game);
-        if ($simpleGame !== '' && str_contains($simpleBody, $simpleGame)) $best = 0.98;
+    // Split numbered choices even when several are on one physical line.
+    // Inline list numbers must use punctuation (1., 2), 3:, etc.).
+    // Bare numbers are NOT inline separators, so titles like Crysis 3
+    // and Wizard of Legend 2 stay intact.
+    $body = preg_replace('/(?<!^)(?<!\n)\s+(?=(?:#?\d{1,3}\s*[\.\)\:\-]\s+))/u', "\n", $body) ?? $body;
 
-        // Compare windows near the title's word count, allowing +/- one token.
-        foreach ([$n-1, $n, $n+1] as $w) {
-            if ($w < 1 || $w > count($bodyTokens)) continue;
-            for ($i=0; $i <= count($bodyTokens)-$w; $i++) {
-                $window = implode(' ', array_slice($bodyTokens, $i, $w));
-                $best = max($best, titleSimilarity($window, $game));
+    $rawLines = preg_split('/\n+/u', $body) ?: [];
+    $segments = [];
+
+    foreach ($rawLines as $raw) {
+        $line = trim($raw);
+        if ($line === '') continue;
+
+        // Accept "1 Game", "1. Game", "1) Game", etc.
+        $line = preg_replace('/^\s*(?:#?\d{1,3}\s*(?:[\.\)\:\-]\s*|\s+)|[-*]\s*)/u', '', $line) ?? $line;
+        $line = trim($line);
+        if ($line === '') continue;
+
+        // If punctuation alone differs from a master title (e.g. V - Rising),
+        // keep it together rather than treating the dash as a separator.
+        $wholeMatches = [];
+        foreach ($games as $game) {
+            if (simplify($line) === simplify($game)) $wholeMatches[] = $game;
+        }
+        if (count($wholeMatches) === 1) {
+            $segments[] = $line;
+            continue;
+        }
+
+        // Split explicit same-line list separators.
+        $parts = preg_split('/\s*(?:;|\||,\s*|\s\/\s|\s+-\s*|\s*-\s+|\s+\&\s+|\s+\bor\b\s+|\s+\band\b\s+)\s*/iu', $line) ?: [$line];
+        $parts = array_values(array_filter(array_map('trim', $parts), fn($v) => $v !== ''));
+        if (count($parts) > 1) {
+            $plausible = 0;
+            foreach ($parts as $part) if (fragmentLikelyGame($part, $games)) $plausible++;
+            if ($plausible >= 2) {
+                foreach ($parts as $part) $segments[] = $part;
+                continue;
             }
         }
-        $scores[$game] = $best;
+
+        // Locate exact master titles anywhere on the line.
+        $hits = [];
+        foreach ($games as $game) {
+            $pos = mb_stripos($line, $game, 0, 'UTF-8');
+            if ($pos !== false) $hits[] = ['pos'=>$pos, 'len'=>mb_strlen($game,'UTF-8'), 'game'=>$game];
+        }
+        usort($hits, fn($a,$b) => $a['pos'] <=> $b['pos']);
+
+        if (count($hits) > 1) {
+            $seen = [];
+            foreach ($hits as $hit) {
+                $k = mb_strtolower($hit['game'], 'UTF-8');
+                if (!isset($seen[$k])) { $seen[$k]=true; $segments[]=$hit['game']; }
+            }
+            continue;
+        }
+
+        // If exactly one title is literal but text before/after it resembles a
+        // second title, split the line around the exact title. This catches
+        // "AC Valhalla Diablo IV" and similar back-to-back lists.
+        if (count($hits) === 1) {
+            $hit = $hits[0];
+            $before = trim(mb_substr($line, 0, $hit['pos'], 'UTF-8'), " \t,;|&-");
+            $afterStart = $hit['pos'] + $hit['len'];
+            $after = trim(mb_substr($line, $afterStart, null, 'UTF-8'), " \t,;|&-");
+            $beforeGame = fragmentLikelyGame($before, $games);
+            $afterGame = fragmentLikelyGame($after, $games);
+            if ($beforeGame || $afterGame) {
+                if ($beforeGame) $segments[] = $before;
+                $segments[] = $hit['game'];
+                if ($afterGame) $segments[] = $after;
+                continue;
+            }
+        }
+
+        $segments[] = $line;
     }
 
-    arsort($scores);
-    $ordered = array_keys($scores);
-    $bestGame = $ordered[0] ?? null;
-    $bestScore = $bestGame !== null ? $scores[$bestGame] : 0.0;
-    $secondScore = isset($ordered[1]) ? $scores[$ordered[1]] : 0.0;
-
-    // Conservative thresholds:
-    // >= .90 and clearly ahead = confident typo/spacing match.
-    // >= .72 = manual review.
-    if ($bestGame !== null && $bestScore >= 0.90 && ($bestScore - $secondScore) >= 0.08) {
-        return ['status'=>'confident','game'=>$bestGame,'score'=>$bestScore,'reason'=>'strong fuzzy match'];
-    }
-    if ($bestGame !== null && $bestScore >= 0.72) {
-        $candidates = [];
-        foreach ($scores as $g=>$s) if ($s >= 0.72) $candidates[$g] = $s;
-        return ['status'=>'uncertain','game'=>$bestGame,'score'=>$bestScore,'reason'=>'possible misspelling','candidates'=>$candidates];
-    }
-    return ['status'=>'none','game'=>null,'score'=>$bestScore,'reason'=>'no sufficiently close game title'];
+    return $segments;
 }
 
-function fetchUserInfo(array $config, string $token, string $username): array {
-    $headers = ['Authorization: Bearer ' . $token, 'User-Agent: ' . $config['user_agent']];
-    $url = 'https://oauth.reddit.com/user/' . rawurlencode($username) . '/about?raw_json=1';
-    $json = redditRequest($url, $headers);
-    $data = $json['data'] ?? null;
-    if (!is_array($data)) throw new RuntimeException('Profile data unavailable.');
+function stripPreferenceNoise(string $segment): string {
+    $s = trim($segment);
+    $s = preg_replace('/^\s*(?:i(?:\'|’)d\s+like|i\s+would\s+like|i\s+want|entering\s+for|my\s+(?:pick|choice|choices)\s*(?:is|are)?|please\s+enter\s+me\s+for)\s*[:\-]?\s*/iu', '', $s) ?? $s;
+    $s = preg_replace('/(?:[\s\.,!;:\-]+)(?:thanks?|thank\s+you|thx|cheers|good\s+luck|appreciate\s+it|please|pls)\b.*$/iu', '', $s) ?? $s;
+    return trim($s, " \t\n\r\0\x0B,.;:!-");
+}
+
+function normalizedTitleWords(string $s): array {
+    $s = mb_strtolower($s, 'UTF-8');
+    $s = str_replace(["’", "`"], "'", $s);
+    $s = preg_replace("/'s\\b/u", '', $s) ?? $s;
+    $s = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $s) ?? '';
+    $parts = array_values(array_filter(preg_split('/\s+/u', trim($s)) ?: []));
+    $roman = ['i'=>'1','ii'=>'2','iii'=>'3','iv'=>'4','v'=>'5','vi'=>'6','vii'=>'7','viii'=>'8','ix'=>'9','x'=>'10'];
+    foreach ($parts as &$p) if (isset($roman[$p])) $p = $roman[$p];
+    unset($p);
+    return $parts;
+}
+
+function significantTitleWords(string $s): array {
+    $stop = ['the'=>true,'a'=>true,'an'=>true,'of'=>true,'for'=>true,'to'=>true,'and'=>true,'or'=>true,'is'=>true,'are'=>true,'in'=>true,'on'=>true,'my'=>true,'i'=>true,'me'=>true,'please'=>true,'pls'=>true,'thanks'=>true,'thank'=>true,'you'=>true,'thx'=>true,'good'=>true,'luck'=>true,'giveaway'=>true,'chance'=>true,'op'=>true,'everyone'=>true];
+    return array_values(array_filter(normalizedTitleWords($s), fn($w) => !isset($stop[$w]) && mb_strlen($w, 'UTF-8') >= 2));
+}
+
+function acronymMatchScore(string $segment, string $game): float {
+    $sw = significantTitleWords($segment); $gw = significantTitleWords($game);
+    if (!$sw || count($gw) < 2) return 0.0;
+    for ($n=2; $n<=min(4,count($gw)); $n++) {
+        $acronym=''; for($i=0;$i<$n;$i++) $acronym .= mb_substr($gw[$i],0,1,'UTF-8');
+        if (($sw[0]??'') !== $acronym) continue;
+        $remainingGame=array_slice($gw,$n); $remainingSeg=array_slice($sw,1);
+        if (!$remainingGame && !$remainingSeg) return 0.98;
+        $hits=0; foreach($remainingGame as $word) if(in_array($word,$remainingSeg,true)) $hits++;
+        if ($remainingGame) { $coverage=$hits/count($remainingGame); if($coverage>=1.0) return 0.97; if($coverage>=0.5) return 0.91; }
+    }
+    return 0.0;
+}
+
+function hasSuspiciousSubtitle(string $segment, string $game): bool {
+    $segWords=normalizedTitleWords(stripPreferenceNoise($segment)); $gameWords=normalizedTitleWords($game);
+    if(!$segWords||!$gameWords||count($segWords)<=count($gameWords)) return false;
+    for($i=0;$i<count($gameWords);$i++) if(($segWords[$i]??null)!==$gameWords[$i]) return false;
+    $extra=array_slice($segWords,count($gameWords)); $allowed=['remastered','remaster','deluxe','edition','complete','goty'];
+    foreach($extra as $word) if(!in_array($word,$allowed,true)) return true;
+    return false;
+}
+
+function bestGameMatchForSegment(string $segment, array $games): array {
+    $segment = stripPreferenceNoise(trim($segment));
+    if ($segment === '') return ['status'=>'review','game'=>null,'score'=>0.0,'reason'=>'could not identify a game'];
+    $segNorm=implode(' ',normalizedTitleWords($segment)); $scores=[]; $subtitleConflict=[];
+    foreach($games as $game){
+        $gameNorm=implode(' ',normalizedTitleWords($game));
+        if($segNorm!=='' && $segNorm===$gameNorm) return ['status'=>'confident','game'=>$game,'score'=>1.0,'reason'=>'exact title'];
+        if(hasSuspiciousSubtitle($segment,$game)) $subtitleConflict[$game]=true;
+        $best=acronymMatchScore($segment,$game);
+        $segmentSimple=simplify($segment); $gameSimple=simplify($game);
+        if($segmentSimple!==''&&$gameSimple!==''){
+            if(str_contains($segmentSimple,$gameSimple)){ $coverage=strlen($gameSimple)/max(1,strlen($segmentSimple)); $best=max($best,min(0.91,0.72+0.19*$coverage)); }
+            elseif(strlen($segmentSimple)>=4&&str_contains($gameSimple,$segmentSimple)){ $coverage=strlen($segmentSimple)/max(1,strlen($gameSimple)); $best=max($best,min(0.94,0.75+0.19*$coverage)); }
+        }
+        $segmentTokens=normalizedTitleWords($segment); $gameTokens=normalizedTitleWords($game); $n=count($gameTokens);
+        foreach([$n-2,$n-1,$n,$n+1,$n+2] as $w){ if($w<1||$w>count($segmentTokens)) continue; for($i=0;$i<=count($segmentTokens)-$w;$i++){ $window=implode(' ',array_slice($segmentTokens,$i,$w)); $best=max($best,titleSimilarity($window,implode(' ',$gameTokens))); } }
+        $best=max($best,titleSimilarity($segNorm,$gameNorm));
+        $a=array_unique(significantTitleWords($segment)); $b=array_unique(significantTitleWords($game));
+        if($a&&$b){ $overlap=count(array_intersect($a,$b)); if($overlap>0){ $tokenScore=$overlap/max(1,min(count($a),count($b))); $best=max($best,0.52+0.38*$tokenScore); } }
+        $scores[$game]=min(1.0,$best);
+    }
+    arsort($scores); $ordered=array_keys($scores); $bestGame=$ordered[0]??null; $bestScore=$bestGame!==null?(float)$scores[$bestGame]:0.0; $secondScore=isset($ordered[1])?(float)$scores[$ordered[1]]:0.0;
+    if($bestGame!==null && isset($subtitleConflict[$bestGame])) return ['status'=>'review','game'=>null,'score'=>$bestScore,'reason'=>'title has additional words; verify that it is the listed game'];
+    if($bestGame!==null && $bestScore>=0.92 && ($bestScore-$secondScore)>=0.05) return ['status'=>'confident','game'=>$bestGame,'score'=>$bestScore,'reason'=>'strong fuzzy/partial match'];
+    if($bestGame!==null && $bestScore>=0.75) return ['status'=>'review','game'=>$bestGame,'score'=>$bestScore,'reason'=>'possible abbreviation or misspelling'];
+    return ['status'=>'review','game'=>null,'score'=>$bestScore,'reason'=>'could not identify a game'];
+}
+
+function parseRankedPreferences(string $body, array $games): array {
+    $segments = preferenceSegments($body, $games);
+    $picks = [];
+    $seenGames = [];
+
+    foreach ($segments as $segment) {
+        $match = bestGameMatchForSegment($segment, $games);
+
+        if ($match['status'] === 'review' &&
+            $match['reason'] === 'segment contains multiple listed titles') {
+
+            $hits = [];
+            foreach ($games as $game) {
+                $pos = mb_stripos($segment, $game, 0, 'UTF-8');
+                if ($pos !== false) $hits[] = ['pos'=>$pos,'game'=>$game];
+            }
+            usort($hits, fn($a,$b) => $a['pos'] <=> $b['pos']);
+
+            foreach ($hits as $hit) {
+                $key = mb_strtolower($hit['game'], 'UTF-8');
+                if (isset($seenGames[$key])) continue;
+                $seenGames[$key] = true;
+                $picks[] = [
+                    'position'=>count($picks)+1,
+                    'segment'=>$hit['game'],
+                    'status'=>'confident',
+                    'game'=>$hit['game'],
+                    'score'=>1.0,
+                    'reason'=>'exact title found in multi-game line',
+                ];
+            }
+            continue;
+        }
+
+        if ($match['game']) {
+            $key = mb_strtolower((string)$match['game'], 'UTF-8');
+            if (isset($seenGames[$key])) continue;
+            $seenGames[$key] = true;
+        }
+
+        $picks[] = [
+            'position'=>count($picks)+1,
+            'segment'=>$segment,
+            'status'=>$match['status'],
+            'game'=>$match['game'],
+            'score'=>$match['score'],
+            'reason'=>$match['reason'],
+        ];
+    }
+
+    return $picks;
+}
+
+function dedupePreferenceGames(array $games): array {
+    $seen = [];
+    $out = [];
+    foreach ($games as $game) {
+        if (!$game) continue;
+        $k = mb_strtolower((string)$game, 'UTF-8');
+        if (isset($seen[$k])) continue;
+        $seen[$k] = true;
+        $out[] = $game;
+    }
+    return $out;
+}
+
+function secureShuffle(array $items): array {
+    $items = array_values($items);
+    for ($i = count($items) - 1; $i > 0; $i--) {
+        $j = random_int(0, $i);
+        [$items[$i], $items[$j]] = [$items[$j], $items[$i]];
+    }
+    return $items;
+}
+
+function allocateByRandomOrder(array $entrants, array $games): array {
+    $randomOrder = secureShuffle($entrants);
+    $available = array_fill_keys($games, true);
+    $assignments = [];
+    $skipped = [];
+
+    foreach ($randomOrder as $drawPosition => $entrant) {
+        $assigned = null;
+        $assignedRank = null;
+
+        foreach ($entrant['preferences'] as $rank => $game) {
+            if (isset($available[$game]) && $available[$game]) {
+                $assigned = $game;
+                $assignedRank = $rank + 1;
+                $available[$game] = false;
+                break;
+            }
+        }
+
+        if ($assigned !== null) {
+            $assignments[] = [
+                'draw_position' => $drawPosition + 1,
+                'author' => $entrant['author'],
+                'game' => $assigned,
+                'preference_rank' => $assignedRank,
+                'preferences' => $entrant['preferences'],
+            ];
+        } else {
+            $skipped[] = [
+                'draw_position' => $drawPosition + 1,
+                'author' => $entrant['author'],
+                'preferences' => $entrant['preferences'],
+                'reason' => empty($entrant['preferences'])
+                    ? 'No valid game preferences'
+                    : 'All requested games had already been assigned',
+            ];
+        }
+
+        if (!in_array(true, $available, true)) break;
+    }
+
+    $unassignedGames = [];
+    foreach ($available as $game => $isAvailable) {
+        if ($isAvailable) $unassignedGames[] = $game;
+    }
+
     return [
-        'comment_karma' => (int)($data['comment_karma'] ?? 0),
-        'created_utc' => (float)($data['created_utc'] ?? 0),
+        'random_order' => $randomOrder,
+        'assignments' => $assignments,
+        'skipped' => $skipped,
+        'unassigned_games' => $unassignedGames,
     ];
 }
 
-function eligibility(array $profile, float $now): array {
-    $created = (float)$profile['created_utc'];
-    $karma = (int)$profile['comment_karma'];
-    $ageDays = $created > 0 ? floor(($now - $created) / 86400) : 0;
-    $reasons = [];
-    if ($ageDays < MIN_ACCOUNT_AGE_DAYS) $reasons[] = "account age {$ageDays} days (minimum " . MIN_ACCOUNT_AGE_DAYS . ')';
-    if ($karma < MIN_COMMENT_KARMA) $reasons[] = "comment karma {$karma} (minimum " . MIN_COMMENT_KARMA . ')';
-    return ['eligible'=>!$reasons,'age_days'=>(int)$ageDays,'comment_karma'=>$karma,'reasons'=>$reasons];
-}
 
-function analyzeThread(array $config, string $token, array $thread, array $games, bool $topLevelOnly): array {
+function analyzeRedditComments(array $thread, array $games): array {
     $byUser = [];
-    $ignoredCounts = ['deleted'=>0,'op'=>0,'reply'=>0,'no_match'=>0];
 
     foreach ($thread['comments'] as $c) {
         $author = trim((string)$c['author']);
-        if ($author === '' || $author === '[deleted]') { $ignoredCounts['deleted']++; continue; }
-        if (strcasecmp($author, $thread['post']['author']) === 0) { $ignoredCounts['op']++; continue; }
-        if ($topLevelOnly && (int)$c['depth'] > 0) { $ignoredCounts['reply']++; continue; }
-
-        $m = bestGameMatch((string)$c['body'], $games);
-        if ($m['status'] === 'none') { $ignoredCounts['no_match']++; continue; }
+        if ($author === '' || $author === '[deleted]') continue;
+        if (strcasecmp($author, $thread['post']['author']) === 0) continue;
+        if ((int)$c['depth'] > 0) continue; // top-level entries only
 
         $key = mb_strtolower($author, 'UTF-8');
-        if (!isset($byUser[$key])) $byUser[$key] = ['author'=>$author,'matches'=>[],'comments'=>[]];
-        $byUser[$key]['matches'][] = $m;
-        $byUser[$key]['comments'][] = $c;
-    }
 
-    $now = time();
-    $profileCache = [];
-    $qualified = [];
-    $ineligible = [];
-    $review = [];
-
-    foreach ($byUser as $key=>$u) {
-        try {
-            if (!isset($profileCache[$key])) {
-                $profileCache[$key] = fetchUserInfo($config, $token, $u['author']);
-                // Gentle pacing for per-user profile requests.
-                usleep(80000);
-            }
-            $elig = eligibility($profileCache[$key], $now);
-        } catch (Throwable $e) {
-            $ineligible[] = [
-                'author'=>$u['author'], 'age_days'=>null, 'comment_karma'=>null,
-                'reasons'=>['Reddit profile could not be verified: ' . $e->getMessage()]
-            ];
-            continue;
-        }
-
-        if (!$elig['eligible']) {
-            $ineligible[] = array_merge(['author'=>$u['author']], $elig);
-            continue;
-        }
-
-        // Consolidate all matching comments by this user.
-        $gamesFound = [];
-        $hasUncertain = false;
-        $bestSuggestion = null;
-        $bestScore = -1.0;
-        foreach ($u['matches'] as $m) {
-            if ($m['status'] === 'confident' && $m['game']) $gamesFound[$m['game']] = true;
-            if ($m['status'] === 'uncertain') {
-                $hasUncertain = true;
-                if (($m['score'] ?? 0) > $bestScore) {
-                    $bestScore = (float)$m['score'];
-                    $bestSuggestion = $m['game'] ?? null;
-                }
-            }
-        }
-
-        if (count($gamesFound) === 1 && !$hasUncertain) {
-            $qualified[] = [
-                'author'=>$u['author'], 'game'=>array_key_first($gamesFound),
-                'age_days'=>$elig['age_days'],'comment_karma'=>$elig['comment_karma'],
-                'comments'=>$u['comments']
-            ];
-        } else {
-            $review[] = [
-                'author'=>$u['author'],
-                'suggested_game'=>count($gamesFound) === 1 ? array_key_first($gamesFound) : $bestSuggestion,
-                'confident_games'=>array_keys($gamesFound),
-                'age_days'=>$elig['age_days'],
-                'comment_karma'=>$elig['comment_karma'],
-                'comments'=>$u['comments'],
-                'matches'=>$u['matches']
+        // One giveaway entry per Reddit account. If the user somehow has
+        // multiple top-level comments, keep the first one encountered.
+        if (!isset($byUser[$key])) {
+            $byUser[$key] = [
+                'author' => $author,
+                'body' => (string)$c['body'],
+                'picks' => parseRankedPreferences((string)$c['body'], $games),
             ];
         }
     }
 
-    return [
-        'qualified'=>$qualified,
-        'review'=>$review,
-        'ineligible'=>$ineligible,
-        'ignored'=>$ignoredCounts,
-    ];
-}
-
-function buildPools(array $games, array $qualified, array $review, array $decisions): array {
-    $pools = array_fill_keys($games, []);
-    $seen = [];
-
-    foreach ($qualified as $u) {
-        $key = mb_strtolower($u['author'], 'UTF-8');
-        if (!isset($seen[$key]) && isset($pools[$u['game']])) {
-            $pools[$u['game']][] = $u;
-            $seen[$key] = true;
-        }
-    }
-
-    foreach ($review as $idx=>$u) {
-        $choice = (string)($decisions[$idx] ?? 'exclude');
-        if ($choice === 'exclude' || !isset($pools[$choice])) continue;
-        $key = mb_strtolower($u['author'], 'UTF-8');
-        if (!isset($seen[$key])) {
-            $u['game'] = $choice;
-            $pools[$choice][] = $u;
-            $seen[$key] = true;
-        }
-    }
-    return $pools;
-}
-
-function chooseWinners(array $pools): array {
-    $winners = [];
-    foreach ($pools as $game=>$pool) {
-        $winners[$game] = $pool ? $pool[random_int(0, count($pool)-1)] : null;
-    }
-    return $winners;
+    return ['users' => array_values($byUser)];
 }
 
 $error = null;
@@ -421,37 +549,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($action === 'analyze') {
             $url = trim((string)($_POST['reddit_url'] ?? ''));
-            $gamesText = (string)($_POST['games'] ?? '');
-            $games = parseGames($gamesText);
-            $topLevelOnly = isset($_POST['top_level_only']);
-
-            if (count($games) < 2) throw new RuntimeException('Enter at least two game titles, one per line.');
-            if (count($games) > 25) throw new RuntimeException('This tool supports up to 25 game titles per drawing.');
+            $games = parseGames((string)($_POST['games'] ?? ''));
+            if (!$games) throw new RuntimeException('Enter at least one game title.');
 
             $token = getAccessToken($config);
             $thread = fetchThread($config, $token, extractPostPath($url));
-            $analysis = analyzeThread($config, $token, $thread, $games, $topLevelOnly);
+            $analysis = analyzeRedditComments($thread, $games);
 
-            $_SESSION['draw_data'] = [
-                'url'=>$url, 'gamesText'=>$gamesText, 'games'=>$games,
-                'topLevelOnly'=>$topLevelOnly, 'thread'=>$thread, 'analysis'=>$analysis
+            $_SESSION['ranked_api'] = [
+                'url'=>$url,'games'=>$games,'thread'=>$thread,'analysis'=>$analysis
             ];
-            $data = $_SESSION['draw_data'];
+            $data = $_SESSION['ranked_api'];
             $stage = 'review';
         } elseif ($action === 'draw') {
-            if (empty($_SESSION['draw_data']) || !is_array($_SESSION['draw_data'])) {
-                throw new RuntimeException('The review session expired. Fetch the Reddit comments again.');
+            if (empty($_SESSION['ranked_api'])) throw new RuntimeException('Review session expired.');
+            $data = $_SESSION['ranked_api'];
+            $decisions = is_array($_POST['pick'] ?? null) ? $_POST['pick'] : [];
+
+            $entrants = [];
+            foreach ($data['analysis']['users'] as $ui=>$u) {
+                $prefs = [];
+                foreach ($u['picks'] as $pi=>$pick) {
+                    $choice = (string)($decisions[$ui][$pi] ?? '');
+                    if ($choice !== '' && in_array($choice, $data['games'], true)) $prefs[] = $choice;
+                }
+                $prefs = dedupePreferenceGames($prefs);
+                if ($prefs) $entrants[] = ['author'=>$u['author'],'preferences'=>$prefs];
             }
-            $data = $_SESSION['draw_data'];
-            $decisions = is_array($_POST['review'] ?? null) ? $_POST['review'] : [];
-            $pools = buildPools($data['games'], $data['analysis']['qualified'], $data['analysis']['review'], $decisions);
-            $winners = chooseWinners($pools);
-            $data['pools'] = $pools;
-            $data['winners'] = $winners;
-            $data['decisions'] = $decisions;
+
+            $data['entrants'] = $entrants;
+            $data['result'] = allocateByRandomOrder($entrants, $data['games']);
             $data['drawn_at'] = date(DATE_RFC3339);
-            $_SESSION['last_result'] = $data;
-            unset($_SESSION['draw_data']);
+            unset($_SESSION['ranked_api']);
             $stage = 'result';
         }
     } catch (Throwable $e) {
@@ -459,9 +588,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stage = 'form';
     }
 }
-
-$defaultUrl = (string)($_POST['reddit_url'] ?? '');
-$defaultGames = (string)($_POST['games'] ?? '');
 ?>
 <!doctype html>
 <html lang="en">
@@ -469,135 +595,98 @@ $defaultGames = (string)($_POST['games'] ?? '');
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?= h(APP_NAME) ?></title>
 <style>
-:root{color-scheme:light dark;--bg:#f4f5f7;--panel:#fff;--text:#202124;--muted:#667085;--border:#d0d5dd;--accent:#ff4500;--soft:#fff4ef;--good:#16794b;--bad:#b42318;--warn:#9a6700}
-@media(prefers-color-scheme:dark){:root{--bg:#111418;--panel:#1b1f24;--text:#eef2f6;--muted:#a7b0bb;--border:#3a414a;--soft:#2a1b16;--good:#65d6a0;--bad:#ff8f87;--warn:#f0c36a}}
+:root{color-scheme:light dark;--bg:#f4f5f7;--panel:#fff;--text:#202124;--muted:#667085;--border:#d0d5dd;--accent:#ff4500;--soft:#fff4ef;--bad:#b42318;--good:#16794b}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--panel:#1b1f24;--text:#eef2f6;--muted:#a7b0bb;--border:#3a414a;--soft:#2a1b16;--bad:#ff8f87;--good:#65d6a0}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1100px;margin:0 auto;padding:32px 18px 60px}h1{margin:0 0 6px;font-size:30px}h2{margin-top:0}h3{margin-bottom:6px}.lead,.muted{color:var(--muted)}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px;margin:18px 0;box-shadow:0 1px 2px rgba(0,0,0,.05)}
-label{display:block;font-weight:650;margin:12px 0 6px}input[type=url],textarea,select{width:100%;padding:11px 12px;border:1px solid var(--border);border-radius:9px;background:transparent;color:inherit;font:inherit}
-textarea{min-height:135px}.check{display:flex;gap:9px;align-items:flex-start;font-weight:500}
-button,.button{appearance:none;border:0;border-radius:9px;background:var(--accent);color:#fff;padding:11px 17px;font-weight:700;font-size:15px;cursor:pointer;margin-top:14px;text-decoration:none;display:inline-block}
-.error{border-left:5px solid var(--bad)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}.card{border:1px solid var(--border);border-radius:11px;padding:15px}.winner{background:var(--soft);border-color:var(--accent)}.winner strong{font-size:20px}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--border);vertical-align:top}th{font-size:13px;color:var(--muted)}
-.badge{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:2px 8px;margin:2px;font-size:12px}.good{color:var(--good)}.bad{color:var(--bad)}.warn{color:var(--warn)}
-.comment{white-space:pre-wrap;background:rgba(127,127,127,.08);padding:10px;border-radius:8px;margin:7px 0}.small{font-size:13px}code{background:rgba(127,127,127,.14);padding:2px 5px;border-radius:4px}
+main{max-width:1150px;margin:0 auto;padding:32px 18px 60px}h1{margin:0 0 6px;font-size:30px}h2{margin-top:0}.muted,.lead{color:var(--muted)}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px;margin:18px 0}.card{border:1px solid var(--border);border-radius:11px;padding:15px;margin:10px 0}
+label{display:block;font-weight:650;margin:12px 0 6px}input[type=url],textarea,select{width:100%;padding:10px;border:1px solid var(--border);border-radius:9px;background:transparent;color:inherit;font:inherit}
+textarea{min-height:150px}button,.button{border:0;border-radius:9px;background:var(--accent);color:#fff;padding:11px 17px;font-weight:700;font-size:15px;cursor:pointer;margin-top:14px;text-decoration:none;display:inline-block}
+.error{border-left:5px solid var(--bad)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--border);vertical-align:top}th{font-size:13px;color:var(--muted)}
+.comment{white-space:pre-wrap;background:rgba(127,127,127,.08);padding:10px;border-radius:8px;margin:7px 0}.small{font-size:13px}.pickrow{display:grid;grid-template-columns:55px minmax(180px,1fr) minmax(260px,1.2fr);gap:10px;align-items:center;margin:8px 0}.rank{font-weight:700}
+@media(max-width:760px){.pickrow{grid-template-columns:1fr}}
 </style>
 </head>
 <body><main>
 <h1><?= h(APP_NAME) ?></h1>
-<p class="lead">One Reddit post, multiple games, automatic eligibility checks, typo-tolerant matching, manual review, then one random winner per game.</p>
+<p class="lead">Fetch top-level Reddit entries, parse ranked preferences, review matches, randomize users once, then assign each entrant their highest-ranked available game.</p>
 
 <?php if ($error): ?><div class="panel error"><strong>Could not continue:</strong> <?= h($error) ?></div><?php endif; ?>
 
 <?php if ($stage === 'form'): ?>
 <form method="post" class="panel">
 <input type="hidden" name="action" value="analyze">
-<label for="reddit_url">Reddit thread URL</label>
-<input id="reddit_url" name="reddit_url" type="url" required placeholder="https://www.reddit.com/r/.../comments/..." value="<?= h($defaultUrl) ?>">
-<label for="games">Games — one title per line</label>
-<textarea id="games" name="games" required placeholder="Game Title One&#10;Game Title Two"><?= h($defaultGames) ?></textarea>
-<label class="check"><input type="checkbox" name="top_level_only" value="1" checked><span>Count top-level comments only <span class="muted">(recommended)</span></span></label>
-<div class="card" style="margin-top:15px">
-<strong>Eligibility requirements</strong><br>
-Account age: at least <?= MIN_ACCOUNT_AGE_DAYS ?> days<br>
-Comment karma: at least <?= MIN_COMMENT_KARMA ?>
-</div>
-<button type="submit">Fetch &amp; check entries</button>
+<label>Reddit thread URL</label>
+<input type="url" name="reddit_url" required>
+<label>Master game list — one game per line</label>
+<textarea name="games" required></textarea>
+<p class="small muted">This version fetches the giveaway thread/comments only. It relies on the subreddit to enforce account-age, karma, and other entry requirements.</p>
+<button type="submit">Fetch thread &amp; parse ranked picks</button>
 </form>
 
-<?php elseif ($stage === 'review'):
-$analysis = $data['analysis']; $post = $data['thread']['post'];
-?>
-<div class="panel">
-<h2>Review before drawing</h2>
-<p><strong><?= h($post['title']) ?></strong><br><span class="muted">r/<?= h($post['subreddit']) ?> · u/<?= h($post['author']) ?></span></p>
-<div class="grid">
-<div class="card"><strong><?= count($analysis['qualified']) ?></strong><br>automatically qualified</div>
-<div class="card"><strong><?= count($analysis['review']) ?></strong><br>need manual review</div>
-<div class="card"><strong><?= count($analysis['ineligible']) ?></strong><br>failed Reddit eligibility</div>
-</div>
-</div>
-
+<?php elseif ($stage === 'review'): ?>
 <form method="post">
 <input type="hidden" name="action" value="draw">
-
-<?php if ($analysis['review']): ?>
 <div class="panel">
-<h2>Questionable game matches</h2>
-<p class="muted">These accounts passed the 10-day/150-comment-karma requirements, but their game choice was misspelled, unclear, or matched more than one title. Choose the intended game or exclude the entry.</p>
-<?php foreach ($analysis['review'] as $i=>$u): ?>
-<div class="card" style="margin:12px 0">
-<h3>u/<?= h($u['author']) ?></h3>
-<div class="small muted">Account age: <?= (int)$u['age_days'] ?> days · Comment karma: <?= (int)$u['comment_karma'] ?></div>
-<?php foreach ($u['comments'] as $c): ?><div class="comment"><?= h($c['body']) ?></div><?php endforeach; ?>
-<label for="review_<?= $i ?>">Decision</label>
-<select id="review_<?= $i ?>" name="review[<?= $i ?>]">
-<option value="exclude">Exclude / cannot determine</option>
+<h2>Review ranked preferences</h2>
+<p><?= count($data['analysis']['users']) ?> unique top-level entrants found.</p><p class="small muted">This version relies on the subreddit's own moderation/eligibility filtering and does not make per-user profile API requests.</p>
+</div>
+
+<?php foreach ($data['analysis']['users'] as $ui=>$u): ?>
+<div class="panel">
+<h2>u/<?= h($u['author']) ?></h2>
+<div class="comment"><?= h($u['body']) ?></div>
+<?php foreach ($u['picks'] as $pi=>$pick): ?>
+<div class="pickrow">
+<div class="rank">#<?= (int)$pick['position'] ?></div>
+<div><strong><?= h($pick['segment']) ?></strong><br><span class="small muted"><?= h($pick['reason']) ?></span></div>
+<div>
+<select name="pick[<?= $ui ?>][<?= $pi ?>]">
+<option value="">Ignore this line</option>
 <?php foreach ($data['games'] as $game): ?>
-<option value="<?= h($game) ?>" <?= $u['suggested_game'] === $game ? 'selected' : '' ?>><?= h($game) ?><?= $u['suggested_game'] === $game ? ' — suggested' : '' ?></option>
+<option value="<?= h($game) ?>" <?= $pick['game']===$game?'selected':'' ?>><?= h($game) ?><?= $pick['game']===$game?' — suggested':'' ?></option>
 <?php endforeach; ?>
 </select>
 </div>
+</div>
 <?php endforeach; ?>
 </div>
-<?php endif; ?>
-
-<div class="panel">
-<h2>Automatically qualified entries</h2>
-<?php if (!$analysis['qualified']): ?><p class="muted">None.</p><?php endif; ?>
-<table><thead><tr><th>User</th><th>Game</th><th>Account age</th><th>Comment karma</th></tr></thead><tbody>
-<?php foreach ($analysis['qualified'] as $u): ?>
-<tr><td>u/<?= h($u['author']) ?></td><td><?= h($u['game']) ?></td><td><?= (int)$u['age_days'] ?> days</td><td><?= (int)$u['comment_karma'] ?></td></tr>
 <?php endforeach; ?>
-</tbody></table>
-</div>
-
-<?php if ($analysis['ineligible']): ?>
-<div class="panel">
-<h2>Ineligible accounts</h2>
-<table><thead><tr><th>User</th><th>Age</th><th>Comment karma</th><th>Reason</th></tr></thead><tbody>
-<?php foreach ($analysis['ineligible'] as $u): ?>
-<tr>
-<td>u/<?= h($u['author']) ?></td>
-<td><?= $u['age_days'] === null ? 'Unknown' : (int)$u['age_days'].' days' ?></td>
-<td><?= $u['comment_karma'] === null ? 'Unknown' : (int)$u['comment_karma'] ?></td>
-<td class="bad"><?= h(implode('; ', $u['reasons'])) ?></td>
-</tr>
-<?php endforeach; ?>
-</tbody></table>
-</div>
-<?php endif; ?>
 
 <div class="panel">
-<p><strong>Nothing has been randomized yet.</strong> The draw happens only when you click below, after you finish reviewing questionable entries.</p>
-<button type="submit">Draw winners</button>
+<p><strong>No randomization has happened yet.</strong></p>
+<button type="submit">Randomize users &amp; assign games</button>
 </div>
 </form>
 
-<?php elseif ($stage === 'result'): ?>
+<?php elseif ($stage === 'result'): $r=$data['result']; ?>
 <div class="panel">
-<h2>Official drawing result</h2>
-<div class="grid">
-<?php foreach ($data['games'] as $game): $pool=$data['pools'][$game] ?? []; $winner=$data['winners'][$game] ?? null; ?>
-<div class="card winner">
-<div class="muted"><?= h($game) ?></div>
-<?php if ($winner): ?><strong>u/<?= h($winner['author']) ?></strong><div><?= count($pool) ?> eligible entrant<?= count($pool)===1?'':'s' ?></div>
-<?php else: ?><strong>No winner</strong><div>0 eligible entrants</div><?php endif; ?>
-</div>
+<h2>Assignments</h2>
+<table><thead><tr><th>Random position</th><th>User</th><th>Game</th><th>Preference</th></tr></thead><tbody>
+<?php foreach ($r['assignments'] as $a): ?>
+<tr><td>#<?= (int)$a['draw_position'] ?></td><td>u/<?= h($a['author']) ?></td><td><?= h($a['game']) ?></td><td>#<?= (int)$a['preference_rank'] ?></td></tr>
 <?php endforeach; ?>
-</div>
-<p class="small muted">Drawn at <?= h($data['drawn_at']) ?> using PHP <code>random_int()</code>. Account rules: ≥ <?= MIN_ACCOUNT_AGE_DAYS ?> days old and ≥ <?= MIN_COMMENT_KARMA ?> comment karma.</p>
+</tbody></table>
+<p class="small muted">Drawn <?= h($data['drawn_at']) ?> using a single secure random entrant order.</p>
 </div>
 
 <div class="panel">
-<h2>Final eligible pools</h2>
-<?php foreach ($data['games'] as $game): ?>
-<h3><?= h($game) ?> (<?= count($data['pools'][$game] ?? []) ?>)</h3>
-<?php foreach ($data['pools'][$game] ?? [] as $u): ?><span class="badge">u/<?= h($u['author']) ?></span><?php endforeach; ?>
-<?php if (!($data['pools'][$game] ?? [])): ?><span class="muted">None</span><?php endif; ?>
-<?php endforeach; ?>
+<h2>Skipped users</h2>
+<?php if (!$r['skipped']): ?><p class="muted">None.</p><?php else: ?>
+<table><thead><tr><th>Position</th><th>User</th><th>Reason</th><th>Preferences</th></tr></thead><tbody>
+<?php foreach ($r['skipped'] as $s): ?><tr><td>#<?= (int)$s['draw_position'] ?></td><td>u/<?= h($s['author']) ?></td><td><?= h($s['reason']) ?></td><td><?= h(implode(' → ', $s['preferences'])) ?></td></tr><?php endforeach; ?>
+</tbody></table><?php endif; ?>
 </div>
 
+<div class="panel">
+<h2>Unassigned games</h2>
+<p><?= $r['unassigned_games'] ? h(implode(', ', $r['unassigned_games'])) : 'All games were assigned.' ?></p>
+</div>
+
+<div class="panel">
+<h2>Full randomized order</h2>
+<ol><?php foreach ($r['random_order'] as $u): ?><li>u/<?= h($u['author']) ?> — <?= h(implode(' → ', $u['preferences'])) ?></li><?php endforeach; ?></ol>
+</div>
 <a class="button" href="<?= h($_SERVER['PHP_SELF']) ?>">Start another giveaway</a>
 <?php endif; ?>
 </main></body></html>

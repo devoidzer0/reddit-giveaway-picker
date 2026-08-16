@@ -1,112 +1,135 @@
-# Reddit Giveaway Picker — API Review Source
+# Reddit Giveaway Picker — Ranked Random Order (API)
 
-This repository contains the source code for a small, private, non-commercial PHP utility used to administer occasional Reddit giveaways.
+This version uses Reddit OAuth/Data API access only to retrieve the giveaway thread and its visible top-level comments.
 
-## Purpose
+It does **not** make per-user profile lookups for account age or comment karma. Eligibility is assumed to have already been enforced by the subreddit/moderation system before the drawing.
 
-The tool reads comments from one Reddit giveaway thread supplied manually by the operator, identifies which listed game each entrant requested, verifies basic eligibility criteria, and randomly selects one winner per game.
+## Ranked giveaway allocation
 
-The utility is read-only with respect to Reddit. It does not post, comment, vote, send messages, moderate communities, or modify Reddit content.
+Entrants may list multiple games in order of preference.
 
-## Eligibility Rules
+After review, the program:
 
-An entrant must have:
+1. randomizes all eligible entrants once
+2. processes that fixed random order from top to bottom
+3. gives each entrant their highest-ranked game still available
+4. removes that game from the available pool
+5. skips a user if every requested game has already been awarded
+6. stops when all games are awarded or all entrants have been processed
 
-- Account age of at least 10 full days
-- At least 150 comment karma
+The program never rerolls or reshuffles midway through a giveaway.
 
-If Reddit account information cannot be verified, that entrant is excluded rather than guessed eligible.
+## Reddit API usage
 
-## Game Matching
+The application uses Reddit only to:
 
-The operator enters the actual game titles, one per line.
+- obtain an OAuth access token
+- retrieve the giveaway post and comments
+- retrieve additional comment children when Reddit omits them from the initial response
 
-The tool:
+It does not:
 
-1. Looks for exact case-insensitive title matches.
-2. Normalizes punctuation and spacing.
-3. Uses conservative fuzzy matching for minor misspellings.
-4. Sends uncertain matches to a manual review screen before the drawing.
-5. Does not randomize anything until the review step is completed.
+- retrieve account profile/karma data
+- post comments
+- vote
+- send messages
+- moderate communities
+- edit or delete Reddit content
 
-## Random Selection
+## Eligibility
 
-Final winners are selected using PHP's `random_int()` from the eligible pool for each game.
+The app treats the subreddit’s own moderation/eligibility filtering as authoritative.
 
-## Reddit Authentication
+This is especially useful for communities that already enforce requirements such as:
 
-The application uses OAuth client credentials.
+- minimum account age
+- minimum comment karma
+- other participation/history rules
 
-The local `config.php` file contains:
+Only visible top-level giveaway entries returned from the thread are considered.
 
-- Reddit client ID
-- Reddit client secret
-- Descriptive User-Agent
+## Preference parsing
 
-`config.php` is intentionally excluded from this repository and is listed in `.gitignore`.
+Each numbered/bulleted line in a user’s comment is compared against the master game list. Exact matches, spacing/punctuation differences, minor misspellings, and some abbreviations can be suggested.
 
-`config.php.example` contains placeholders only.
+Every detected preference appears on the review screen so the operator can correct or ignore it before any randomization happens.
 
-## Reddit Endpoints Used
+## Allocation rule
 
-The application accesses only the following Reddit endpoints:
+Example randomized order:
 
-### OAuth token
+1. User A — Game 1 → Game 2 → Game 3
+2. User B — Game 1 → Game 3
+3. User C — Game 2 → Game 1
 
-`POST https://www.reddit.com/api/v1/access_token`
+If User A receives Game 1, User B’s first choice is no longer available, so User B receives Game 3. User C then receives Game 2.
 
-Used to obtain an OAuth bearer token with the application's client credentials.
+If all of a user’s requested games are already taken, that user is skipped and the program continues down the same random order.
 
-### Read giveaway thread and comments
+## No fixed game limit
 
-`GET https://oauth.reddit.com/comments/{post_id}`
-
-Used to retrieve the manually supplied giveaway post and its comments.
-
-### Retrieve additional comment children
-
-`GET https://oauth.reddit.com/api/morechildren`
-
-Used only when the giveaway thread contains additional comment objects not included in the initial thread response.
-
-### Read public Reddit account information
-
-`GET https://oauth.reddit.com/user/{username}/about`
-
-Used only for entrants whose comments appear to request one of the listed giveaway games.
-
-The application reads:
-
-- `created_utc`
-- `comment_karma`
-
-These values are used solely to apply the giveaway's published eligibility requirements.
-
-## Data Handling
-
-- The tool is run manually for occasional giveaways.
-- It does not continuously monitor Reddit.
-- It does not build user profiles.
-- It does not sell, redistribute, or monetize Reddit data.
-- It does not use Reddit data for advertising.
-- It does not use Reddit data to train AI or machine-learning models.
-- Data is used only to determine giveaway eligibility and select winners.
-
-## Source Files
-
-- `index.php` — application logic, Reddit API access, matching, eligibility checks, manual review, and drawing
-- `config.php.example` — credential configuration template with placeholders only
-- `.htaccess` — optional Apache protection for configuration files
-- `.gitignore` — prevents local credentials from being committed
+There is no fixed maximum number of games.
 
 ## Requirements
 
 - PHP 8.1+
-- PHP cURL extension
-- PHP mbstring extension
-- Reddit API credentials
-- Network access to Reddit
+- PHP cURL
+- PHP mbstring
+- approved Reddit API credentials
 
-## Security
 
-The real `config.php` containing credentials must remain private and must never be committed to source control.
+## Supported preference-list formats
+
+The parser now handles:
+
+```text
+1. Game A
+2. Game B
+3. Game C
+```
+
+```text
+Game A
+
+Game B
+
+Game C
+```
+
+```text
+Game A, Game B, Game C
+```
+
+```text
+Game A - Game B - Game C
+```
+
+```text
+Game A; Game B; Game C
+```
+
+and mixed numbered/bulleted formatting.
+
+Comma splitting is conservative so ordinary prose containing a comma is less likely to be broken into fake game choices. Hyphens are treated as separators only when surrounded by spaces, so normal hyphenated game titles are preserved.
+
+If one line contains several exact game titles from the master list, each title is extracted separately and kept in order.
+
+
+## Parser v3
+
+Improved multi-game comment parsing for commas, blank lines, conjunctions, spaced dashes, back-to-back exact titles, abbreviations, and minor misspellings.
+
+
+## Parser v4 safeguards
+
+- Suggestions below 75% confidence default to `Ignore this line`.
+- Thank-you/giveaway prose is stripped before matching where possible.
+- Generic words no longer inflate token-overlap scores.
+- Roman numerals and Arabic digits are normalized.
+- Acronyms such as `AC Valhalla` and `SMT V` are recognized more strongly.
+- Longer titles that merely begin with a listed title (for example `Life is Strange: Double Exposure`) are not treated as exact matches.
+
+
+## Parser v5 fix
+
+Inline bare numbers are no longer interpreted as new list items. Titles such as `Crysis 3` and `Wizard of Legend 2` therefore remain intact. Bare numbered entries like `1 Crysis 3` are still accepted when the number begins a physical line. Inline numbered lists remain supported when item numbers use punctuation, such as `1. Game A 2. Game B`.
